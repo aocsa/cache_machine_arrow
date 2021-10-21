@@ -1,0 +1,6 @@
+
+cmake_modules/
+data/
+build/
+.vscode/
+.idea/
