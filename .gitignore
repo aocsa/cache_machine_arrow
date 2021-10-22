@@ -2,5 +2,6 @@
 cmake_modules/
 data/
 build/
+cmake-build-debug/
 .vscode/
 .idea/
