@@ -223,6 +223,8 @@ public:
                  std::vector<std::string> input_labels,
                  std::shared_ptr<Schema> output_schema, int num_outputs);
 
+  virtual ~DataHolderNode();
+
   void ErrorReceived(ExecNodeKernel *input, Status error) override {
     DCHECK_EQ(input, inputs_[0]);
     outputs_[0]->ErrorReceived(this, std::move(error));
@@ -300,8 +302,6 @@ protected:
   // Variable used to cancel remaining tasks in the executor
   StopSource stop_source_;
 
-  std::thread run_thread_;
-
   std::unique_ptr<CacheMachine> cache_machine_;
 };
 
@@ -314,53 +314,47 @@ DataHolderNode::DataHolderNode(ExecPlanKernel *plan, NodeVector inputs,
                      /*num_outputs=*/num_outputs) {
   executor_ = plan->exec_context()->executor();
   assert(executor_ != nullptr);
-  // todo run this into an executor!!
   cache_machine_ = std::make_unique<CacheMachine>(plan->exec_context());
 
-  run_thread_ = std::thread([this] { this->Execute(); });
+  auto status = task_group_.AddTask([this]() -> Result<Future<>> {
+    return executor_->Submit(this->stop_source_.token(), [this] {
+      auto generator = this->cache_machine_->generator();
+      using T =  DataHolderPushGenerator::T;
+      struct LoopBody {
+        Future<ControlFlow<bool>> operator()() {
+          auto next = generator_();
+          return next.Then([this](const T& result) -> Result<ControlFlow<bool>> {
+            if (IsIterationEnd(result)) {
+              node_->finished_.MarkFinished();
+              return Break(true);
+            } else {
+              Result<ExecBatch>  batch = result->Get();
+              if (node_ && !node_->finished_.is_finished())
+                node_->outputs_[0]->InputReceivedTask(node_, [](ExecBatch batch) { return batch; }, batch.ValueOrDie());
+              return Continue();
+            }
+          });
+        }
+        AsyncGenerator<T> generator_;
+        DataHolderNode* node_;
+      };
+      auto future = Loop(LoopBody{std::move(generator), this});
+      auto ret =  future.result();
+      return Status::OK();
+    });
+  });
+  if (!status.ok()) {
+    if (input_counter_.Cancel()) {
+      this->Finish(status);
+    }
+    inputs_[0]->StopProducing(this);
+  }
 }
 
+DataHolderNode::~DataHolderNode() {
+ }
+
 void DataHolderNode::Execute() {
-//  while (!this->cache_machine_->is_finished()) {
-//    std::unique_ptr<DataHolder> data_holder = this->cache_machine_->pull();
-//    if (data_holder) {
-//      printf("$$$$$$$$$$$$[0]->InputReceivedTask\n");
-//      outputs_[0]->InputReceivedTask(
-//          this, [](ExecBatch batch) { return batch; },
-//          data_holder->Get().ValueOrDie());
-//    }
-//  }
-//  printf("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@2\n");
-//  std::cerr << "pool->size() : " << cache_machine_->size() << std::endl;
-
-  auto generator = this->cache_machine_->generator();
-  using T =  DataHolderPushGenerator::T;
-  struct LoopBody {
-    Future<ControlFlow<bool>> operator()() {
-      auto next = generator_();
-       return next.Then([this](const T& result) -> Result<ControlFlow<bool>> {
-        if (IsIterationEnd(result)) {
-          printf("$$$$$$$$$$$$ node_->finished_.MarkFinished()\n");
-
-          node_->finished_.MarkFinished();
-
-          return Break(true);
-        } else {
-//          if (node_->finished_.is_finished()) {
-//            printf("$$$$$$$$$$$ node_->finished_.is_finished() \n");
-//            return Break(true);
-//          }
-          printf("$$$$$$$$$$$$[0]->InputReceivedTask\n");
-          Result<ExecBatch>  batch = result->Get();
-          node_->outputs_[0]->InputReceivedTask(node_, [](ExecBatch batch) { return batch; }, batch.ValueOrDie());
-          return Continue();
-        }
-      });
-    }
-    AsyncGenerator<T> generator_;
-    DataHolderNode* node_;
-   };
-  Loop(LoopBody{std::move(generator), this});
 }
 
 void DataHolderNode::InputReceivedTask(
@@ -428,9 +422,7 @@ void DataHolderNode::Finish(Status finish_st /* = Status::OK()*/) {
 //      this->cache_machine_->finish();
       this->cache_machine_->producer_.Close();
 
-      if (this->run_thread_.joinable()) {
-        this->run_thread_.join();
-      }
+
 //    }
 
   } else {
