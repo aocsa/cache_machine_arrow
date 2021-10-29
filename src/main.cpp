@@ -1,65 +1,9 @@
 #include <iostream>
 
-#include <arrow/api.h>
-#include <arrow/compute/api.h>
-#include <arrow/dataset/api.h>
-#include <arrow/filesystem/api.h>
-#include <parquet/file_reader.h>
+#include "data_holder_manager.h"
 
-#include "arrow/dataset/scanner.h"
-
-#include "arrow/record_batch.h"
-#include "arrow/table.h"
-#include "arrow/util/thread_pool.h"
-
-#include "arrow/compute/api.h"
-#include "arrow/compute/api_scalar.h"
-#include "arrow/compute/api_vector.h"
-#include "arrow/compute/cast.h"
-#include "arrow/compute/exec/exec_plan.h"
-#include "arrow/compute/exec/test_util.h"
-#include "arrow/compute/exec/util.h"
-#include "arrow/dataset/dataset.h"
-#include "arrow/ipc/api.h"
-#include "arrow/pretty_print.h"
-#include "arrow/testing/random.h"
-#include "arrow/util/async_generator.h"
-#include "arrow/util/async_util.h" //AsyncTaskGroup
-#include "arrow/util/checked_cast.h"
-#include "arrow/util/future.h"
-#include "arrow/util/logging.h"
-#include "arrow/util/optional.h"
-#include "arrow/util/range.h"
-#include "arrow/util/thread_pool.h"
-#include "arrow/util/unreachable.h"
-#include "arrow/util/vector.h"
-
-#include "arrow/testing/gtest_util.h"
-
-#include "parquet/arrow/reader.h"
-#include "parquet/arrow/writer.h"
-#include "parquet/platform.h"
-#include "parquet/properties.h"
-
-#include <algorithm>
-#include <condition_variable>
-#include <deque>
-#include <functional>
-#include <future>
-#include <iostream>
-#include <limits>
-#include <list>
-#include <memory>
-
-#include <mutex>
-#include <random>
-#include <string>
-#include <thread>
-#include <vector>
 
 #include "async.h"
-#include "memory_resource.h"
-#include "cache_machine.h"
 #include "exec_node.h"
 #include "exec_plan.h"
 
@@ -67,8 +11,6 @@ namespace arrow {
 using internal::checked_cast;
 
 namespace compute {
-
-/////////////////////////////////////////////////////////
 
 class DataHolderNodeOptions : public ExecNodeOptions {
 public:
@@ -78,144 +20,6 @@ public:
   bool async_mode;
 };
 
-
-class DataHolderPushGenerator {
-public:
-  using T = std::unique_ptr<DataHolder>;
-
-  struct State {
-    util::Mutex mutex;
-    std::deque<Result<T>> result_q;
-    util::optional<Future<T>> consumer_fut;
-    bool finished = false;
-  };
-public:
-  class Producer {
-  public:
-
-    explicit Producer(const std::shared_ptr<State>& state) : weak_state_(state) {}
-
-    bool Push(Result<T> result) {
-      auto state = weak_state_.lock();
-      if(!state) {
-        return false;
-      }
-      auto lock = state->mutex.Lock();
-      if(state->finished) {
-        return false;
-      }
-      if(state->consumer_fut.has_value()) {
-        auto fut = std::move(state->consumer_fut.value());
-        state->consumer_fut.reset();
-        lock.Unlock();
-        fut.MarkFinished(std::move(result));
-      } else {
-        state->result_q.push_back(std::move(result));
-      }
-      return true;
-    }
-
-    bool Close() {
-      std::cerr << "close producer\n";
-      auto state = weak_state_.lock();
-      if(!state) {
-        return false;
-      }
-      auto lock = state->mutex.Lock();
-      if(state->finished) {
-        return false;
-      }
-      state->finished = true;
-      if(state->consumer_fut.has_value()) {
-        auto fut = std::move(state->consumer_fut.value());
-        state->consumer_fut.reset();
-        lock.Unlock();
-        fut.MarkFinished(IterationTraits<T>::End());
-        std::cerr << " close producer> MarkFinished\n";
-      }
-      std::cerr << " close producer> TRUE\n";
-
-      return true;
-    }
-    bool is_closed() const {
-      auto state = weak_state_.lock();
-      if (!state) {
-        // Generator was destroyed
-        return true;
-      }
-      auto lock = state->mutex.Lock();
-      return state->finished;
-    }
-  private:
-    const std::weak_ptr<State> weak_state_;
-  };
-  DataHolderPushGenerator() : state_(std::make_shared<State>()) {}
-
-  Future<T> operator()() const {
-    auto lock = state_->mutex.Lock();
-    assert(!state_->consumer_fut.has_value());
-    if (!state_->result_q.empty()) {
-      auto front = std::move(state_->result_q.front());
-      auto fut = Future<T>::MakeFinished(std::move(front));
-      state_->result_q.pop_front();
-      return fut;
-    }
-    if (state_->finished) {
-      return AsyncGeneratorEnd<T>();
-    }
-    auto fut = Future<T>::Make();
-    state_->consumer_fut = fut;
-    return fut;
-  }
-
-  Producer producer() { return Producer{state_}; }
-
-private:
-  const std::shared_ptr<State> state_;
-};
-
-
-class CacheMachine {
-public:
-  CacheMachine(ExecContext *context) : context_(context), gen_(), producer_(gen_.producer()) {
-    this->memory_resources_.push_back(&CPUMemoryResource::getInstance());
-    this->memory_resources_.push_back(&DiskMemoryResource::getInstance());
-  }
-
-  void push(ExecBatch batch, std::shared_ptr<Schema> schema) {
-    int cache_index = 0;
-    while (cache_index < this->memory_resources_.size()) {
-      auto memory_to_use =
-          this->memory_resources_[cache_index]->get_memory_used() +
-          SizeInBytes(batch, schema);
-      if (memory_to_use <
-          this->memory_resources_[cache_index]->get_memory_limit()) {
-        if (cache_index == 0) {
-          //          printf("push>CPUDataHolder\n");
-          auto data_holder = std::make_unique<CPUDataHolder>(
-              batch.ToRecordBatch(schema).ValueOrDie(), schema);
-          this->producer_.Push(std::move(data_holder));
-        } else if (cache_index == 1) {
-          //          printf("push>DiskDataHolder\n");
-          auto disk_data_holder =
-              std::make_unique<DiskDataHolder>(batch, schema);
-          this->producer_.Push(std::move(disk_data_holder));
-        }
-      }
-      cache_index++;
-    }
-  }
-
-  AsyncGenerator<DataHolderPushGenerator::T> generator() {
-     return gen_;
-  }
-
-public:
-  DataHolderPushGenerator gen_;
-  DataHolderPushGenerator::Producer producer_;
-  std::vector<MemoryResource *> memory_resources_;
-  ExecContext *context_;
-};
 
 class DataHolderNode : public ExecNodeKernel {
 public:
@@ -302,7 +106,7 @@ protected:
   // Variable used to cancel remaining tasks in the executor
   StopSource stop_source_;
 
-  std::unique_ptr<CacheMachine> cache_machine_;
+  std::unique_ptr<DataHolderManager> data_holder_manager_;
 };
 
 DataHolderNode::DataHolderNode(ExecPlanKernel *plan, NodeVector inputs,
@@ -314,12 +118,12 @@ DataHolderNode::DataHolderNode(ExecPlanKernel *plan, NodeVector inputs,
                      /*num_outputs=*/num_outputs) {
   executor_ = plan->exec_context()->executor();
   assert(executor_ != nullptr);
-  cache_machine_ = std::make_unique<CacheMachine>(plan->exec_context());
+  data_holder_manager_ = std::make_unique<DataHolderManager>((DataHolderExecContext*)plan->exec_context());
 
   auto status = task_group_.AddTask([this]() -> Result<Future<>> {
     return executor_->Submit(this->stop_source_.token(), [this] {
-      auto generator = this->cache_machine_->generator();
-      using T =  DataHolderPushGenerator::T;
+      auto generator = this->data_holder_manager_->generator();
+      using T =  std::unique_ptr<DataHolder>;
       struct LoopBody {
         Future<ControlFlow<bool>> operator()() {
           auto next = generator_();
@@ -365,32 +169,34 @@ void DataHolderNode::InputReceivedTask(
     return;
   }
 
-  //  auto task = [this, prev_task, batch]() {
-  auto output_batch = prev_task(std::move(batch));
-  if (ErrorIfNotOk(output_batch.status())) {
-    status = output_batch.status();
-  } else {
-    auto output_batch_unsafe = output_batch.MoveValueUnsafe();
-    cache_machine_->push(output_batch_unsafe, this->output_schema_);
-    status = Status::OK();
-  }
-  //  };
+  auto task = [this, prev_task, batch]() {
+    auto output_batch = prev_task(std::move(batch));
+    Status status;
+    if (ErrorIfNotOk(output_batch.status())) {
+      status = output_batch.status();
+    } else {
+      auto output_batch_unsafe = output_batch.MoveValueUnsafe();
+      data_holder_manager_->Push(output_batch_unsafe, this->output_schema_);
+      status = Status::OK();
+    }
+    return status;
+  };
   //  status = task();
 
-  //  status = task_group_.AddTask([this, task]() -> Result<Future<>> {
-  //    return this->executor_->Submit(this->stop_source_.token(), [this,
-  //    task]() {
-  //      auto status = task();
-  //      if (this->input_counter_.Increment()) {
-  //        this->Finish(status);
-  //      }
-  //      return status;
-  //    });
-  //  });
+  status = task_group_.AddTask([this, task]() -> Result<Future<>> {
+    return this->executor_->Submit(this->stop_source_.token(), [this,
+    task]() {
+      auto status = task();
+      if (this->input_counter_.Increment()) {
+        this->Finish(status);
+      }
+      return status;
+    });
+  });
 
-  if (this->input_counter_.Increment()) {
-    this->Finish(status);
-  }
+//  if (this->input_counter_.Increment()) {
+//    this->Finish(status);
+//  }
 
   if (!status.ok()) {
     if (input_counter_.Cancel()) {
@@ -418,9 +224,9 @@ void DataHolderNode::Finish(Status finish_st /* = Status::OK()*/) {
     //      this->finished_.MarkFinished(final_status);
     //    });
 //    if (finish_st.ok()) {
-      printf("###cache_machine_->finish\n");
-//      this->cache_machine_->finish();
-      this->cache_machine_->producer_.Close();
+      printf("###data_holder_manager_->finish\n");
+//      this->data_holder_manager_->finish();
+      this->data_holder_manager_->producer_.Close();
 
 
 //    }
@@ -480,7 +286,7 @@ struct SourceNode : public ExecNodeKernel {
     if (executor) {
       // These options will transfer execution to the desired Executor if
       // necessary. This can happen for in-memory scans where batches didn't
-      // require any CPU work to decode. Otherwise, parsing etc should have
+      // require any CPU_LEVEL work to decode. Otherwise, parsing etc should have
       // already been placed us on the desired Executor and no queues will be
       // pushed to.
       options.executor = executor;
@@ -1045,12 +851,12 @@ BatchesWithSchema MakeBasicBatches(std::shared_ptr<Schema> schema,
 
 void TestStartProducing() {
   std::cerr << "TestStartProducing\n";
-  compute::ExecContext exec_context(default_memory_pool(),
+  DataHolderExecContext exec_context(default_memory_pool(),
                                     ::arrow::internal::GetCpuThreadPool());
 
   ASSERT_OK_AND_ASSIGN(auto plan, ExecPlanKernel::Make(&exec_context));
 
-  int num_batches = 10;
+  int num_batches = 1000;
   int batch_size = 10;
   RecordBatchVector batches =
       ::arrow::compute::GenerateBatches(GetSchema(), num_batches, batch_size);
@@ -1119,12 +925,25 @@ void TestStartProducing() {
 } // namespace compute
 } // namespace arrow
 
+
+/*
+ * 1. Memory Resource API > SizeInBytes() [weston]
+ * 2. DataHolder
+ *  3. ExecBatch > move ownership (share_pointer ->)
+ *
+ *
+ * 1. Fragments
+ *            -> Person {ExecNode1, ExecNode2, ExecNode3 ... ExecNodeN} -> DataHolder  ---
+ *                                                                                        --- JOIN -> [xecNode1, ExecNode2, ExecNode3 ... ExecNodeN] - SinkNode
+ *            -> Country {ExecNode1, ExecNode2, ExecNode3 ... ExecNodeN} -> DataHolder ---
+ * 2. task processing >
+ *     -  error handling! ->
+ * */
 int main(int argc, char *argv[]) {
 
   //  arrow::internal::RunInSerialExecutor();
 
   //  arrow::internal::ThreadPoolSubmit();
-  CPUMemoryResource::getInstance().initialize(/*host_memory_quota=*/0.75);
 
   arrow::compute::TestStartProducing();
   return 0;

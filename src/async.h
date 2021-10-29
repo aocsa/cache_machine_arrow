@@ -40,7 +40,7 @@ namespace arrow {
 /// \brief A generator where the producer pushes items on a queue.
 ///
 /// No back-pressure is applied, so this generator is mostly useful when
-/// producing the values is neither CPU- nor memory-expensive (e.g. fetching
+/// producing the values is neither CPU_LEVEL- nor memory-expensive (e.g. fetching
 /// filesystem metadata).
 ///
 /// This generator is not async-reentrant.
@@ -174,7 +174,7 @@ public:
 
   /// \brief Return producer-side interface
   ///
-  /// The returned object must be used by the producer to push values on the queue.
+  /// The returned object must be used by the producer to Push values on the queue.
   /// Only a single Producer object should be instantiated.
   Producer producer() { return Producer{state_}; }
 
