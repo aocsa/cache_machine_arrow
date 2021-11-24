@@ -211,10 +211,6 @@ public:
 
   std::string ToString() const;
 
-  virtual void InputReceivedTask(ExecNodeKernel *input,
-                                 std::function<Result<ExecBatch>(ExecBatch)> fn,
-                                 ExecBatch batch) = 0;
-
 protected:
   ExecNodeKernel(ExecPlanKernel *plan, NodeVector inputs,
                  std::vector<std::string> input_labels,

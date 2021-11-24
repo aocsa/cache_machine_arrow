@@ -1,6 +1,5 @@
 #pragma once
 
-
 #include <arrow/api.h>
 #include <arrow/compute/api.h>
 #include <arrow/dataset/api.h>
@@ -61,37 +60,139 @@
 
 #include "memory_resource.h"
 
-
+#include "arrow/io/file.h"
 #include <arrow/filesystem/filesystem.h>
 #include <arrow/ipc/reader.h>
 #include <arrow/ipc/writer.h>
-#include "arrow/io/file.h"
 
 namespace arrow {
 namespace compute {
 
+using namespace std::chrono_literals;
+
+class Task {
+public:
+  Task(ExecBatch batch, std::function<Result<ExecBatch>(ExecBatch)> fn)
+      : batch_(std::move(batch)), fn_(std::move(fn)) {}
+
+  Status Run() {
+    auto task_result = this->fn_(batch_);
+    if (task_result.ok()) {
+      return Status::OK();
+    } else {
+      // retry!
+    }
+  }
+
+private:
+  ExecBatch batch_;
+  std::function<Result<ExecBatch>(ExecBatch)> fn_;
+};
+
+class WaitingQueue {
+public:
+  WaitingQueue() : finished{false} {}
+  ~WaitingQueue() = default;
+
+public:
+  void finish() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    this->finished = true;
+    condition_variable_.notify_all();
+  }
+
+  bool is_finished() {
+    return this->finished.load(std::memory_order_seq_cst) &&
+           this->queue_.empty();
+  }
+
+  std::shared_ptr<Task> pull() {
+    std::unique_lock<std::mutex> lock(mutex_);
+
+    while (!condition_variable_.wait_for(lock, 60000ms, [&, this] {
+      bool done_waiting = this->finished.load(std::memory_order_seq_cst) or
+                          !this->queue_.empty();
+      return done_waiting;
+    })) {
+    }
+    if (this->queue_.size() == 0) {
+      return nullptr;
+    }
+    auto data = std::move(this->queue_.front());
+    this->queue_.pop_front();
+    return std::move(data);
+  }
+
+  void push(std::shared_ptr<Task> &task) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    this->queue_.push_back(task);
+    lock.unlock();
+    condition_variable_
+        .notify_all(); // Note: Very important to notify all threads
+  }
+
+  size_t size() const { return queue_.size(); }
+
+private:
+  std::mutex mutex_;
+  std::atomic<bool> finished;
+
+  std::deque<std::shared_ptr<Task>> queue_;
+  std::condition_variable condition_variable_;
+};
+
+using Executor = ::arrow::internal::Executor;
+
+class Scheduler {
+public:
+  explicit Scheduler(Executor *executor) : executor_(executor) {}
+
+  Status AddTask(std::shared_ptr<Task> task) { task_queue_.push(task); }
+
+  Status StartScheduling() {}
+
+  Status Abort() {}
+
+private:
+  Executor *executor_;
+  WaitingQueue task_queue_;
+};
+
+static std::unique_ptr<Scheduler> CreateScheduler(Executor *executor) {
+  auto scheduler = std::make_unique<Scheduler>(executor);
+  return scheduler;
+}
+
+Scheduler *GetScheduler(Executor *executor) {
+  static auto scheduler = CreateScheduler(executor);
+  return scheduler.get();
+}
 
 struct DataHolderExecContext : ExecContext {
-  explicit DataHolderExecContext(MemoryPool* pool = default_memory_pool(),
-                                 ::arrow::internal::Executor* executor = NULLPTR,
-                                 FunctionRegistry* func_registry = NULLPTR)
-      : ExecContext (pool, executor, func_registry)
-  {
+  explicit DataHolderExecContext(
+      MemoryPool *pool = default_memory_pool(),
+      ::arrow::internal::Executor *executor = NULLPTR,
+      FunctionRegistry *func_registry = NULLPTR, Scheduler *scheduler = NULLPTR)
+      : ExecContext(pool, executor, func_registry) {
     memory_resources_stats_.emplace_back(
         std::make_shared<::arrow::internal::CPUMemoryResourceStats>(pool));
     memory_resources_stats_.emplace_back(
         std::make_shared<::arrow::internal::DiskMemoryResourceStats>());
+
+    scheduler_ = GetScheduler(executor);
   }
 
-  size_t memory_resources_size() {
-    return memory_resources_stats_.size();
-  }
+  size_t memory_resources_size() { return memory_resources_stats_.size(); }
 
-  std::shared_ptr<::arrow::internal::MemoryResourceStats> memory_resource(size_t index) {
+  std::shared_ptr<::arrow::internal::MemoryResourceStats>
+  memory_resource(size_t index) {
     return memory_resources_stats_[index];
   }
+
 private:
-  std::vector<std::shared_ptr<::arrow::internal::MemoryResourceStats>> memory_resources_stats_;
+  std::vector<std::shared_ptr<::arrow::internal::MemoryResourceStats>>
+      memory_resources_stats_;
+  Scheduler *scheduler_;
 };
 
 using namespace std::chrono_literals;
@@ -99,9 +200,7 @@ using namespace std::chrono_literals;
 enum class DataHolderType { CPU_LEVEL, DISK_LEVEL };
 
 struct DataHolder {
-  explicit DataHolder(DataHolderType type)
-      : type_(type) {}
-
+  explicit DataHolder(DataHolderType type) : type_(type) {}
 
   DataHolderType type() const { return type_; };
 
@@ -115,15 +214,16 @@ private:
 
 class CPUDataHolder : public DataHolder {
 public:
-  explicit CPUDataHolder(const std::shared_ptr<RecordBatch>& record_batch)
-      : DataHolder(DataHolderType::CPU_LEVEL), batch_(std::move(record_batch)) {}
+  explicit CPUDataHolder(const std::shared_ptr<RecordBatch> &record_batch)
+      : DataHolder(DataHolderType::CPU_LEVEL), batch_(std::move(record_batch)) {
+  }
 
   virtual size_t SizeInBytes() const override {
     auto record_batch = batch_;
     size_t size_in_bytes = 0;
-    for (auto&& column : record_batch->columns()) {
-      const auto& data = column->data();
-      for (auto&& buffer : data->buffers) {
+    for (auto &&column : record_batch->columns()) {
+      const auto &data = column->data();
+      for (auto &&buffer : data->buffers) {
         if (buffer) {
           size_in_bytes += buffer->size();
         }
@@ -155,22 +255,24 @@ std::string RandomString(std::size_t length) {
   return random_string;
 }
 
-//using WriterProperties = parquet::WriterProperties;
-//using ArrowWriterProperties = parquet::ArrowWriterProperties;
+// using WriterProperties = parquet::WriterProperties;
+// using ArrowWriterProperties = parquet::ArrowWriterProperties;
 //
-//using FileReader = parquet::arrow::FileReader;
-//using ParquetFileReader = parquet::ParquetFileReader;
+// using FileReader = parquet::arrow::FileReader;
+// using ParquetFileReader = parquet::ParquetFileReader;
 
-Status StoreRecordBatch(const std::shared_ptr<RecordBatch>& record_batch,
-                        const std::shared_ptr<fs::FileSystem>& filesystem,
-                        const std::string& file_path) {
+Status StoreRecordBatch(const std::shared_ptr<RecordBatch> &record_batch,
+                        const std::shared_ptr<fs::FileSystem> &filesystem,
+                        const std::string &file_path) {
   auto output = filesystem->OpenOutputStream(file_path).ValueOrDie();
-  auto writer =
-      arrow::ipc::MakeFileWriter(output.get(), record_batch->schema()).ValueOrDie();
+  auto writer = arrow::ipc::MakeFileWriter(output.get(), record_batch->schema())
+                    .ValueOrDie();
   ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*record_batch));
   return writer->Close();
 }
-Result<std::shared_ptr<RecordBatch>> RecoverRecordBatch(const std::shared_ptr<fs::FileSystem>& filesystem, const std::string& file_path) {
+Result<std::shared_ptr<RecordBatch>>
+RecoverRecordBatch(const std::shared_ptr<fs::FileSystem> &filesystem,
+                   const std::string &file_path) {
   ARROW_ASSIGN_OR_RAISE(auto input, filesystem->OpenInputFile(file_path));
   ARROW_ASSIGN_OR_RAISE(auto reader, arrow::ipc::feather::Reader::Open(input));
   std::shared_ptr<Table> table;
@@ -183,17 +285,18 @@ namespace ds = arrow::dataset;
 
 class DiskDataHolder : public DataHolder {
 public:
-  explicit DiskDataHolder(const std::shared_ptr<RecordBatch>& record_batch)
-      : DataHolder( DataHolderType::CPU_LEVEL) {
+  explicit DiskDataHolder(const std::shared_ptr<RecordBatch> &record_batch)
+      : DataHolder(DataHolderType::CPU_LEVEL) {
     std::string root_path;
     std::string file_name = "data-holder-temp-" + RandomString(64) + ".feather";
 
     filesystem_ =
-        arrow::fs::FileSystemFromUri(cache_storage_root_path, &root_path).ValueOrDie();
+        arrow::fs::FileSystemFromUri(cache_storage_root_path, &root_path)
+            .ValueOrDie();
 
     file_path_ = root_path + file_name;
     status_ = StoreRecordBatch(record_batch, filesystem_, file_path_);
-   }
+  }
   virtual size_t SizeInBytes() const override {
     struct stat st;
     if (stat(this->file_path_.c_str(), &st) == 0)
@@ -203,7 +306,8 @@ public:
   }
 
   Result<ExecBatch> Get() override {
-    ARROW_ASSIGN_OR_RAISE(auto record_batch, RecoverRecordBatch(filesystem_, file_path_));
+    ARROW_ASSIGN_OR_RAISE(auto record_batch,
+                          RecoverRecordBatch(filesystem_, file_path_));
     return ExecBatch(*record_batch);
   }
 
@@ -212,15 +316,14 @@ private:
   std::shared_ptr<arrow::fs::FileSystem> filesystem_;
   Status status_;
   const std::string cache_storage_root_path = "file:///tmp/";
-
 };
 
 size_t SizeInBytes(ExecBatch batch, std::shared_ptr<Schema> schema) {
   auto record_batch = batch.ToRecordBatch(schema).ValueOrDie();
   size_t size_in_bytes = 0;
-  for (auto&& column : record_batch->columns()) {
-    const auto& data = column->data();
-    for (auto&& buffer : data->buffers) {
+  for (auto &&column : record_batch->columns()) {
+    const auto &data = column->data();
+    for (auto &&buffer : data->buffers) {
       if (buffer) {
         size_in_bytes += buffer->size();
       }
@@ -231,13 +334,13 @@ size_t SizeInBytes(ExecBatch batch, std::shared_ptr<Schema> schema) {
 
 class DataHolderManager {
 public:
-  DataHolderManager(DataHolderExecContext* context)
+  DataHolderManager(DataHolderExecContext *context)
       : context_(context), gen_(), producer_(gen_.producer()) {}
 
   Status Push(ExecBatch batch, std::shared_ptr<Schema> schema) {
     int index = 0;
     while (index < context_->memory_resources_size()) {
-      auto&& resource = context_->memory_resource(index);
+      auto &&resource = context_->memory_resource(index);
       auto memory_to_use = resource->memory_used() + SizeInBytes(batch, schema);
       if (memory_to_use < resource->memory_limit()) {
         if (index == static_cast<int>(DataHolderType::CPU_LEVEL)) {
@@ -245,10 +348,12 @@ public:
               batch.ToRecordBatch(schema).ValueOrDie());
           this->producer_.Push(std::move(data_holder));
         } else if (index == static_cast<int>(DataHolderType::DISK_LEVEL)) {
-          auto disk_data_holder = std::make_unique<DiskDataHolder>(batch.ToRecordBatch(schema).ValueOrDie());
+          auto disk_data_holder = std::make_unique<DiskDataHolder>(
+              batch.ToRecordBatch(schema).ValueOrDie());
           this->producer_.Push(std::move(disk_data_holder));
         } else {
-          return Status::NotImplemented("There is not a default data holder registered");
+          return Status::NotImplemented(
+              "There is not a default data holder registered");
         }
         break;
       }
@@ -262,8 +367,8 @@ public:
 public:
   PushGenerator<std::unique_ptr<DataHolder>> gen_;
   PushGenerator<std::unique_ptr<DataHolder>>::Producer producer_;
-  DataHolderExecContext* context_;
+  DataHolderExecContext *context_;
 };
 
-}  // namespace compute
-}  // namespace arrow
+} // namespace compute
+} // namespace arrow
